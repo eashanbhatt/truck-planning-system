@@ -1,6 +1,6 @@
 # Truck Load Planning System
 
-> Replaced a \$320k/yr third-party planning tool (Mercury Gate) with an in-house Python system.  
+> Replaced a \$320k/yr third-party planning tool with an in-house Python system.  
 > Cut load planning time from **2 hours → 30 minutes** and saved **\$110k/month** in operational costs.
 
 ---
@@ -174,4 +174,4 @@ Solver: **PuLP + CBC** — 100% open-source, no licence needed.
 
 ---
 
-*Built as a replacement for Mercury Gate at LSC Communications (2018–2021).*
+*Python-based freight planning system — clustering and MILP optimisation.*
