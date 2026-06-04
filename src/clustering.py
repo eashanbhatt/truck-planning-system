@@ -1,38 +1,47 @@
 """
-clustering.py
--------------
-Two-stage clustering pipeline for shipment consolidation:
+clustering.py  —  Module 1 core logic
+--------------------------------------
+Two-stage clustering pipeline to build a load plan:
 
   Stage 1 — KMeans on destination lat/lon
-            Partitions the country into geographic delivery zones (default k=8).
+            Groups the country into k geographic zones.
 
   Stage 2 — Agglomerative (hierarchical) clustering within each zone
-            Groups nearby shipments that share a similar pickup window,
-            producing candidate consolidated loads.
+            Further groups nearby shipments into candidate consolidated loads.
 
-Usage
------
-    from src.clustering import LoadConsolidator
+  Stage 3 — Greedy bin-packing
+            Packs each cluster into TL trucks (max 44,000 lbs, max MAX_STOPS
+            distinct destinations per truck).  Leftover OPTIONAL shipments
+            (weight ≤ 15,000 lbs) remain as individual LTL moves.
 
-    lc = LoadConsolidator(n_zones=8, max_cluster_miles=150)
-    clustered_df = lc.fit(shipments_df)
-    summary = lc.cluster_summary()
+Output columns added to the DataFrame
+--------------------------------------
+    zone_id        : KMeans zone (0 … k-1)
+    cluster_id     : stage-2 cluster label  e.g. "Z2_C04"
+    truck_id       : assigned truck  e.g. "TRK-001"  or  "LTL"
+    assigned_mode  : "TL" or "LTL"
+    truck_weight   : total weight on the assigned truck
+    n_stops        : number of distinct destinations on the truck
+    tl_cost        : TL truck cost (0 for LTL rows)
+    ltl_cost_ind   : individual LTL cost for this shipment
+    plan_cost      : actual cost charged (tl_cost / n_on_truck  for TL, ltl_cost_ind for LTL)
 """
 
 import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.preprocessing import StandardScaler
-from typing import Optional
+from typing import List, Dict, Tuple
 
+from src.cost_utils import ltl_cost, tl_cost, route_distance
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-TL_WEIGHT_THRESHOLD = 15_000   # lbs — above this, TL is typically cheaper than LTL
-TL_WEIGHT_CAPACITY  = 44_000   # lbs — legal max weight for a standard 53-ft trailer
-TL_VOLUME_CAPACITY  = 2_400    # cuft — 53 ft × 8.5 ft × 9 ft (approx)
+TL_MAX_LBS   = 44_000
+LTL_MAX_LBS  = 15_000
+MAX_STOPS    = 3        # max distinct delivery destinations per TL truck
 
 
 # ---------------------------------------------------------------------------
@@ -41,175 +50,270 @@ TL_VOLUME_CAPACITY  = 2_400    # cuft — 53 ft × 8.5 ft × 9 ft (approx)
 
 class LoadConsolidator:
     """
-    Clusters shipments into candidate consolidated loads.
+    Two-stage clustering + greedy bin-packing load planner.
 
     Parameters
     ----------
-    n_zones : int
-        Number of geographic destination zones (KMeans k).
-    max_cluster_miles : float
-        Maximum radius (miles) for intra-zone Agglomerative clusters.
-        Converted to degrees for the distance threshold (~1° ≈ 69 miles).
-    min_cluster_size : int
-        Minimum shipments required to form a cluster (singleton → stays LTL).
-    seed : int
-        Random state for KMeans reproducibility.
+    n_zones           : KMeans k (geographic zones)
+    max_cluster_miles : intra-zone Agglomerative distance threshold (miles)
+    seed              : random state for reproducibility
     """
 
     def __init__(
         self,
         n_zones: int = 8,
-        max_cluster_miles: float = 150,
-        min_cluster_size: int = 2,
+        max_cluster_miles: float = 200,
         seed: int = 42,
     ):
         self.n_zones = n_zones
         self.max_cluster_miles = max_cluster_miles
-        self.distance_threshold = max_cluster_miles / 69.0   # degrees
-        self.min_cluster_size = min_cluster_size
         self.seed = seed
-
-        self._kmeans: Optional[KMeans] = None
-        self._clustered_df: Optional[pd.DataFrame] = None
+        self._plan: pd.DataFrame | None = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def fit(self, shipments: pd.DataFrame) -> pd.DataFrame:
+    def build_plan(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Run both clustering stages and return an annotated DataFrame.
+        Run the full clustering pipeline and return an annotated DataFrame.
 
-        New columns added
-        -----------------
-        zone_id        : KMeans zone (0 … n_zones-1)
-        cluster_id     : global unique cluster label  (e.g. "Z2_C04")
-        cluster_weight : total weight of all shipments in this cluster
-        cluster_volume : total volume of all shipments in this cluster
-        is_tl_eligible : bool — cluster weight exceeds TL threshold
+        Parameters
+        ----------
+        df : output of data_loader.load_shipments()
+
+        Returns
+        -------
+        pd.DataFrame with zone_id, cluster_id, truck_id, assigned_mode,
+        truck_weight, n_stops, tl_cost, ltl_cost_ind, plan_cost columns added.
         """
-        df = shipments.copy()
+        df = df.copy()
 
-        # Stage 1: geographic zone assignment
+        # Pre-compute individual LTL cost for every shipment (used in comparison)
+        df["ltl_cost_ind"] = df.apply(
+            lambda r: ltl_cost(r["weight_lbs"], r["distance_miles"], r["freight_class"]),
+            axis=1,
+        )
+
+        # Stage 1: zone assignment
         df = self._assign_zones(df)
 
         # Stage 2: hierarchical clustering within each zone
         df = self._cluster_within_zones(df)
 
-        # Annotate with cluster-level aggregates
-        df = self._annotate_clusters(df)
+        # Stage 3: greedy bin-packing into TL trucks
+        df = self._pack_trucks(df)
 
-        self._clustered_df = df
+        self._plan = df
         return df
 
-    def cluster_summary(self) -> pd.DataFrame:
-        """
-        Return a per-cluster summary DataFrame.
-        Raises RuntimeError if fit() has not been called.
-        """
-        if self._clustered_df is None:
-            raise RuntimeError("Call fit() before cluster_summary().")
+    def plan_summary(self) -> pd.DataFrame:
+        """Per-truck summary. Raises if build_plan() not called yet."""
+        if self._plan is None:
+            raise RuntimeError("Call build_plan() first.")
 
-        df = self._clustered_df
-        grp = df.groupby("cluster_id").agg(
-            n_shipments    = ("shipment_id",       "count"),
-            total_weight   = ("weight_lbs",        "sum"),
-            total_volume   = ("volume_cuft",       "sum"),
-            avg_distance   = ("distance_miles",    "mean"),
-            baseline_cost  = ("ltl_cost_baseline", "sum"),
-            region         = ("region",            lambda x: x.mode()[0]),
-            pickup_date    = ("pickup_date",       "min"),
-        ).reset_index()
+        df = self._plan
+        tl_rows  = df[df["assigned_mode"] == "TL"]
+        ltl_rows = df[df["assigned_mode"] == "LTL"]
 
-        grp["is_tl_eligible"] = grp["total_weight"] >= TL_WEIGHT_THRESHOLD
-        grp["utilisation_pct"] = (grp["total_weight"] / TL_WEIGHT_CAPACITY * 100).round(1)
-        return grp.sort_values("total_weight", ascending=False).reset_index(drop=True)
+        truck_summary = (
+            tl_rows.groupby("truck_id")
+            .agg(
+                n_shipments   = ("shipment_id",   "count"),
+                total_weight  = ("weight_lbs",    "sum"),
+                n_stops       = ("dest_city",     "nunique"),
+                truck_cost    = ("tl_cost",       "first"),
+                ltl_baseline  = ("ltl_cost_ind",  "sum"),
+            )
+            .reset_index()
+        )
+        truck_summary["savings"] = truck_summary["ltl_baseline"] - truck_summary["truck_cost"]
+        truck_summary["util_pct"] = (
+            truck_summary["total_weight"] / TL_MAX_LBS * 100
+        ).round(1)
+
+        return truck_summary
 
     # ------------------------------------------------------------------
-    # Private helpers
+    # Stage 1 — KMeans zones
     # ------------------------------------------------------------------
 
     def _assign_zones(self, df: pd.DataFrame) -> pd.DataFrame:
-        """KMeans on destination lat/lon → zone_id column."""
         coords = df[["dest_lat", "dest_lon"]].values
-        km = KMeans(n_clusters=self.n_zones, random_state=self.seed, n_init=10)
+        k = min(self.n_zones, len(df))
+        km = KMeans(n_clusters=k, random_state=self.seed, n_init=10)
         df["zone_id"] = km.fit_predict(coords)
-        self._kmeans = km
         return df
 
+    # ------------------------------------------------------------------
+    # Stage 2 — Agglomerative within each zone
+    # ------------------------------------------------------------------
+
     def _cluster_within_zones(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Within each KMeans zone, run Agglomerative clustering.
-        Features: dest_lat, dest_lon, pickup_date (ordinal), weight.
-        """
-        all_parts = []
-        global_cluster_counter = 0
+        dist_thresh = self.max_cluster_miles / 69.0   # approx degrees
+        parts = []
+        counter = 0
 
         for zone_id, zone_df in df.groupby("zone_id"):
+            zone_df = zone_df.copy()
+
             if len(zone_df) == 1:
-                # Singleton zone — no consolidation possible
-                zone_df = zone_df.copy()
-                zone_df["_local_cluster"] = 0
-                zone_df["cluster_id"] = f"Z{zone_id}_C{global_cluster_counter:03d}"
-                global_cluster_counter += 1
-                all_parts.append(zone_df)
+                zone_df["cluster_id"] = f"Z{zone_id}_C{counter:03d}"
+                counter += 1
+                parts.append(zone_df)
                 continue
 
-            # Build feature matrix
-            scaler = StandardScaler()
-            pickup_ordinal = pd.to_datetime(zone_df["pickup_date"]).map(
-                lambda d: d.toordinal()
-            ).values.reshape(-1, 1)
+            # Feature matrix: lat/lon (primary) + weight (secondary)
+            scaler  = StandardScaler()
+            coords  = scaler.fit_transform(zone_df[["dest_lat", "dest_lon"]].values)
+            weights = StandardScaler().fit_transform(zone_df[["weight_lbs"]].values)
+            features = np.hstack([coords * 1.0, weights * 0.15])
 
-            coords = zone_df[["dest_lat", "dest_lon"]].values
-            weight = zone_df[["weight_lbs"]].values
-
-            # Scale features: coordinates dominate, pickup date secondary
-            features = np.hstack([
-                scaler.fit_transform(coords) * 1.0,
-                scaler.fit_transform(pickup_ordinal) * 0.3,
-                scaler.fit_transform(weight) * 0.2,
-            ])
-
-            agg = AgglomerativeClustering(
+            agg    = AgglomerativeClustering(
                 n_clusters=None,
-                distance_threshold=self.distance_threshold,
+                distance_threshold=dist_thresh,
                 linkage="ward",
             )
-            local_labels = agg.fit_predict(features)
+            labels = agg.fit_predict(features)
+            zone_df["_local"] = labels
 
-            zone_df = zone_df.copy()
-            zone_df["_local_cluster"] = local_labels
+            for local_id in np.unique(labels):
+                mask = zone_df["_local"] == local_id
+                zone_df.loc[mask, "cluster_id"] = f"Z{zone_id}_C{counter:03d}"
+                counter += 1
 
-            # Map local labels → global cluster IDs
-            for local_id in np.unique(local_labels):
-                mask = zone_df["_local_cluster"] == local_id
-                sub  = zone_df[mask]
+            zone_df.drop(columns=["_local"], inplace=True)
+            parts.append(zone_df)
 
-                if len(sub) < self.min_cluster_size:
-                    # Too small to consolidate — keep as individual LTL
-                    for idx in sub.index:
-                        zone_df.loc[idx, "cluster_id"] = (
-                            f"Z{zone_id}_C{global_cluster_counter:03d}"
+        return pd.concat(parts).sort_index()
+
+    # ------------------------------------------------------------------
+    # Stage 3 — Greedy bin-packing into TL trucks
+    # ------------------------------------------------------------------
+
+    def _pack_trucks(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        For each cluster, greedily assign shipments to TL trucks.
+
+        Rules
+        -----
+        - MUST_TL shipments (weight > LTL_MAX_LBS) are packed first.
+        - OPTIONAL shipments are added to open trucks if they fit.
+        - A truck closes when: weight > TL_MAX_LBS OR distinct destinations > MAX_STOPS.
+        - Remaining OPTIONAL shipments ship as individual LTL.
+        """
+        wh_lat = df["warehouse_lat"].iloc[0]
+        wh_lon = df["warehouse_lon"].iloc[0]
+
+        df = df.copy()
+        df["truck_id"]      = "LTL"
+        df["assigned_mode"] = "LTL"
+        df["tl_cost"]       = 0.0
+        df["truck_weight"]  = 0.0
+        df["n_stops"]       = 0
+
+        truck_counter = 1
+        all_assignments: Dict[str, dict] = {}   # truck_id → {weight, stops, indices}
+
+        for cluster_id, cluster_df in df.groupby("cluster_id"):
+            # Sort: MUST_TL first (heaviest first), then OPTIONAL
+            must_tl  = cluster_df[cluster_df["mode"] == "MUST_TL"].sort_values(
+                "weight_lbs", ascending=False
+            )
+            optional = cluster_df[cluster_df["mode"] == "OPTIONAL"].sort_values(
+                "weight_lbs", ascending=False
+            )
+            ordered  = pd.concat([must_tl, optional])
+
+            current_truck  = None   # truck_id string
+            current_weight = 0.0
+            current_stops:  set = set()
+            current_indices: List[int] = []
+
+            def _close_truck():
+                nonlocal current_truck, current_weight, current_stops, current_indices
+                if current_indices:
+                    stops_list = [
+                        (df.at[i, "dest_lat"], df.at[i, "dest_lon"])
+                        for i in set(
+                            df.loc[current_indices, ["dest_lat", "dest_lon"]]
+                            .drop_duplicates()
+                            .apply(tuple, axis=1)
                         )
-                        global_cluster_counter += 1
+                    ]
+                    route_mi = route_distance(wh_lat, wh_lon, stops_list)
+                    truck_cost = tl_cost(route_mi)
+                    all_assignments[current_truck] = {
+                        "weight": current_weight,
+                        "stops":  len(current_stops),
+                        "cost":   truck_cost,
+                        "indices": list(current_indices),
+                    }
+                current_truck  = None
+                current_weight = 0.0
+                current_stops  = set()
+                current_indices = []
+
+            for idx, row in ordered.iterrows():
+                dest_key = (row["dest_city"], row["dest_state"])
+                new_weight = current_weight + row["weight_lbs"]
+                new_stops  = current_stops | {dest_key}
+
+                fits = (new_weight <= TL_MAX_LBS) and (len(new_stops) <= MAX_STOPS)
+
+                if current_truck is None:
+                    # Open a new truck regardless (MUST_TL might need its own)
+                    current_truck  = f"TRK-{truck_counter:03d}"
+                    truck_counter += 1
+                    current_weight = row["weight_lbs"]
+                    current_stops  = {dest_key}
+                    current_indices = [idx]
+
+                    # If this single shipment already exceeds TL cap → flag warning
+                    if row["weight_lbs"] > TL_MAX_LBS:
+                        print(f"  ⚠  {row['shipment_id']} ({row['weight_lbs']:,.0f} lbs) "
+                              f"exceeds TL capacity — shipping oversize.")
+
+                elif fits:
+                    current_weight += row["weight_lbs"]
+                    current_stops.add(dest_key)
+                    current_indices.append(idx)
+
                 else:
-                    cid = f"Z{zone_id}_C{global_cluster_counter:03d}"
-                    zone_df.loc[mask, "cluster_id"] = cid
-                    global_cluster_counter += 1
+                    _close_truck()
+                    # Start fresh truck for this shipment
+                    current_truck  = f"TRK-{truck_counter:03d}"
+                    truck_counter += 1
+                    current_weight = row["weight_lbs"]
+                    current_stops  = {dest_key}
+                    current_indices = [idx]
 
-            all_parts.append(zone_df)
+            _close_truck()   # close final open truck
 
-        result = pd.concat(all_parts).sort_index()
-        result.drop(columns=["_local_cluster"], errors="ignore", inplace=True)
-        return result
+        # Apply assignments back to df
+        for truck_id, info in all_assignments.items():
+            idxs = info["indices"]
+            # Only assign to TL if at least one MUST_TL or total weight makes TL worthwhile
+            total_w  = info["weight"]
+            cost_tl  = info["cost"]
+            cost_ltl = df.loc[idxs, "ltl_cost_ind"].sum()
 
-    def _annotate_clusters(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add cluster-level weight / volume / eligibility back to each row."""
-        agg = df.groupby("cluster_id").agg(
-            cluster_weight=("weight_lbs",  "sum"),
-            cluster_volume=("volume_cuft", "sum"),
-        )
-        df = df.join(agg, on="cluster_id")
-        df["is_tl_eligible"] = df["cluster_weight"] >= TL_WEIGHT_THRESHOLD
+            if cost_tl < cost_ltl or any(df.loc[idxs, "mode"] == "MUST_TL"):
+                df.loc[idxs, "truck_id"]      = truck_id
+                df.loc[idxs, "assigned_mode"] = "TL"
+                df.loc[idxs, "tl_cost"]       = cost_tl
+                df.loc[idxs, "truck_weight"]  = total_w
+                df.loc[idxs, "n_stops"]       = info["stops"]
+            # else: leave as LTL
+
+        # Compute final plan_cost per row
+        df["plan_cost"] = df.apply(
+            lambda r: (
+                r["tl_cost"] / max(1, (df["truck_id"] == r["truck_id"]).sum())
+                if r["assigned_mode"] == "TL"
+                else r["ltl_cost_ind"]
+            ),
+            axis=1,
+        ).round(2)
+
         return df

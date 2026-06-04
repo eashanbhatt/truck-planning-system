@@ -1,96 +1,63 @@
 """
-optimizer.py
-------------
-Mixed-Integer Linear Program (MILP) for truck load optimisation.
+optimizer.py  —  Module 2 core logic
+--------------------------------------
+Mixed-Integer Linear Program (MILP) using PuLP + open-source CBC solver.
 
-For each geographic cluster produced by LoadConsolidator, the optimizer
-decides how many TL trucks to dispatch and which shipments ride on each,
-minimising total freight cost subject to weight and volume capacity.
+Approach
+--------
+Shipments are first grouped by US region (Northeast, Southeast, etc.)
+for tractability.  Within each region the MILP decides:
 
-Formulation
------------
+  • Which shipments to consolidate onto TL trucks
+  • Which shipments remain as individual LTL moves
+
+to minimise total freight cost.
+
+MILP Formulation (per region)
+------------------------------
 Sets
-  S = {shipments in cluster}
-  T = {1 … N_trucks}  (upper bound on trucks needed)
+  S  — shipments in this region
+  T  — potential trucks  {1 … N_T}  (upper bound pre-computed)
+  D  — distinct destination cities in S
 
 Variables
-  x[s, t] ∈ {0, 1}   1 if shipment s is loaded on truck t
-  y[t]    ∈ {0, 1}   1 if truck t is activated
+  x[s, t] ∈ {0,1}   1 if shipment s is on truck t
+  y[t]    ∈ {0,1}   1 if truck t is activated
+  z[d, t] ∈ {0,1}   1 if destination d is served by truck t
 
 Objective
   min  Σ_t  TL_cost(t) · y[t]
      + Σ_s  LTL_cost(s) · (1 − Σ_t x[s,t])
 
 Constraints
-  Σ_t x[s,t] ≤ 1                          ∀ s   (each shipment on ≤1 truck)
-  Σ_s weight[s]·x[s,t] ≤ CAP_W · y[t]    ∀ t   (weight capacity)
-  Σ_s volume[s]·x[s,t] ≤ CAP_V · y[t]    ∀ t   (volume capacity)
-  x[s,t] ≤ y[t]                           ∀ s,t (link)
+  (1)  Σ_t x[s,t] ≤ 1                          ∀ s     assignment
+  (2)  Σ_s weight[s]·x[s,t] ≤ TL_MAX · y[t]   ∀ t     weight cap
+  (3)  x[s,t] ≤ z[dest(s), t]                  ∀ s,t   link ship→dest
+  (4)  Σ_d z[d,t] ≤ MAX_STOPS · y[t]           ∀ t     stop limit
+  (5)  x[s,t] ≤ y[t]                            ∀ s,t   link ship→truck
+  (6)  MUST_TL shipments: Σ_t x[s,t] = 1        ∀ s∈MUST_TL   (forced onto a truck)
 
-Usage
------
-    from src.optimizer import LoadOptimizer
-    from src.clustering import LoadConsolidator
-
-    lc = LoadConsolidator()
-    clustered = lc.fit(shipments)
-    summary   = lc.cluster_summary()
-
-    opt = LoadOptimizer()
-    plan = opt.optimize(clustered, summary)
-    opt.print_summary()
+Solver: CBC (bundled with PuLP — no licence required)
 """
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple
-from dataclasses import dataclass, field
+from typing import List, Dict
 from pulp import (
     LpProblem, LpMinimize, LpVariable, LpBinary,
     lpSum, value, PULP_CBC_CMD, LpStatus,
 )
 
+from src.cost_utils import ltl_cost, tl_cost, route_distance
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-TL_WEIGHT_CAPACITY = 44_000   # lbs
-TL_VOLUME_CAPACITY = 2_400    # cuft
-TL_RATE_PER_MILE   = 3.25     # $/mile (flat rate regardless of weight)
-TL_BASE_COST       = 150.0    # $ fixed accessorial / fuel surcharge per truck
-
-
-@dataclass
-class LoadPlanEntry:
-    """One row in the final load plan."""
-    cluster_id:    str
-    truck_id:      str
-    shipments:     List[str]      # shipment_ids
-    total_weight:  float
-    total_volume:  float
-    mode:          str            # "TL" or "LTL"
-    tl_cost:       float
-    ltl_cost:      float
-    optimized_cost: float
-    savings:       float
-
-
-# ---------------------------------------------------------------------------
-# Cost helpers
-# ---------------------------------------------------------------------------
-
-def _ltl_cost(weight_lbs: float, distance_miles: float, freight_class: float) -> float:
-    """
-    Simplified LTL tariff (per-CWT rate × hundredweight).
-    Rate increases with distance and freight class.
-    """
-    rate_per_cwt = 20.0 + (distance_miles / 100) * 1.5 + (freight_class - 50) * 0.05
-    return round((weight_lbs / 100) * rate_per_cwt, 2)
-
-
-def _tl_cost(distance_miles: float) -> float:
-    """Flat TL rate: base + per-mile charge."""
-    return round(TL_BASE_COST + TL_RATE_PER_MILE * distance_miles, 2)
+TL_MAX_LBS   = 44_000
+LTL_MAX_LBS  = 15_000
+MAX_STOPS    = 3
+SOLVER_TIME  = 60     # seconds per region sub-problem
 
 
 # ---------------------------------------------------------------------------
@@ -99,189 +66,220 @@ def _tl_cost(distance_miles: float) -> float:
 
 class LoadOptimizer:
     """
-    Solves the TL/LTL assignment MILP for each cluster independently,
-    then aggregates results into a full load plan.
+    MILP-based load planner.  Solves one sub-problem per geographic region.
+
+    Parameters
+    ----------
+    solver_verbose : print CBC solver output (default False)
     """
 
-    def __init__(
-        self,
-        tl_weight_cap: float = TL_WEIGHT_CAPACITY,
-        tl_volume_cap: float = TL_VOLUME_CAPACITY,
-        tl_rate_per_mile: float = TL_RATE_PER_MILE,
-        solver_msg: bool = False,
-    ):
-        self.tl_weight_cap   = tl_weight_cap
-        self.tl_volume_cap   = tl_volume_cap
-        self.tl_rate_per_mile = tl_rate_per_mile
-        self.solver_msg      = solver_msg
-
-        self._load_plan: List[LoadPlanEntry] = []
-        self._total_baseline: float = 0.0
-        self._total_optimized: float = 0.0
+    def __init__(self, solver_verbose: bool = False):
+        self.solver_verbose = solver_verbose
+        self._plan: pd.DataFrame | None = None
+        self._baseline_cost: float = 0.0
+        self._optimized_cost: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def optimize(
-        self,
-        clustered_df: pd.DataFrame,
-        cluster_summary: pd.DataFrame,
-    ) -> pd.DataFrame:
+    def build_plan(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Optimise every cluster and build the load plan.
+        Run the MILP for every region and return an annotated DataFrame.
 
-        Returns
-        -------
-        pd.DataFrame
-            One row per truck / LTL shipment with cost details.
+        New columns added
+        -----------------
+            truck_id        : "TRK-001" … or "LTL"
+            assigned_mode   : "TL" or "LTL"
+            tl_cost         : cost of the assigned TL truck (0 for LTL rows)
+            ltl_cost_ind    : individual LTL cost for this shipment
+            plan_cost       : effective cost charged to this shipment
+            solver_status   : "Optimal" / "Feasible" / "LTL-fallback"
         """
-        self._load_plan = []
+        df = df.copy()
 
-        for _, cluster_row in cluster_summary.iterrows():
-            cid = cluster_row["cluster_id"]
-            shipments = clustered_df[clustered_df["cluster_id"] == cid].copy()
-
-            if len(shipments) == 0:
-                continue
-
-            entries = self._optimize_cluster(cid, shipments, cluster_row)
-            self._load_plan.extend(entries)
-
-        plan_df = self._to_dataframe()
-        self._total_baseline  = clustered_df["ltl_cost_baseline"].sum()
-        self._total_optimized = plan_df["optimized_cost"].sum()
-        return plan_df
-
-    def print_summary(self) -> None:
-        """Print a formatted cost comparison to stdout."""
-        if not self._load_plan:
-            print("No plan generated — call optimize() first.")
-            return
-
-        plan_df = self._to_dataframe()
-        tl_loads   = plan_df[plan_df["mode"] == "TL"]
-        ltl_loads  = plan_df[plan_df["mode"] == "LTL"]
-
-        savings    = self._total_baseline - self._total_optimized
-        pct_saving = savings / self._total_baseline * 100 if self._total_baseline else 0
-
-        sep = "─" * 54
-        print(f"\n{'═'*54}")
-        print(f"  LOAD OPTIMISER — RESULTS SUMMARY")
-        print(f"{'═'*54}")
-        print(f"\n{'COST BREAKDOWN':}")
-        print(sep)
-        print(f"  {'Metric':<32} {'Value':>18}")
-        print(sep)
-        print(f"  {'Baseline (all LTL)':<32} {'${:>14,.0f}'.format(self._total_baseline)}")
-        print(f"  {'Optimised total cost':<32} {'${:>14,.0f}'.format(self._total_optimized)}")
-        print(f"  {'Savings':<32} {'${:>14,.0f}'.format(savings)}")
-        print(f"  {'Savings %':<32} {pct_saving:>17.1f}%")
-        print(sep)
-
-        print(f"\n{'LOAD PLAN SUMMARY':}")
-        print(sep)
-        print(f"  {'TL loads dispatched':<32} {len(tl_loads):>18,}")
-        print(f"  {'LTL shipments (individual)':<32} {len(ltl_loads):>18,}")
-        print(f"  {'Avg TL utilisation':<32} "
-              f"{(tl_loads['total_weight'].mean() / self.tl_weight_cap * 100):>17.1f}%"
-              if len(tl_loads) else "  {'Avg TL utilisation':<32} {'N/A':>18}")
-        print(f"  {'Total TL cost':<32} {'${:>14,.0f}'.format(tl_loads['optimized_cost'].sum())}")
-        print(f"  {'Total LTL cost':<32} {'${:>14,.0f}'.format(ltl_loads['optimized_cost'].sum())}")
-        print(f"{'═'*54}\n")
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    def _optimize_cluster(
-        self,
-        cluster_id: str,
-        shipments: pd.DataFrame,
-        cluster_meta: pd.Series,
-    ) -> List[LoadPlanEntry]:
-        """
-        Solve the MILP for a single cluster.
-        Falls back to all-LTL if the cluster is too small or the solver fails.
-        """
-        n = len(shipments)
-        avg_dist = cluster_meta["avg_distance"]
-
-        # Upper bound on trucks needed (ceiling of total weight / capacity)
-        total_weight = shipments["weight_lbs"].sum()
-        n_trucks = max(1, int(np.ceil(total_weight / self.tl_weight_cap)) + 1)
-
-        # Precompute per-shipment costs
-        shipments = shipments.copy()
-        shipments["ltl_cost"] = shipments.apply(
-            lambda r: _ltl_cost(r["weight_lbs"], r["distance_miles"], r["freight_class"]),
+        # Pre-compute individual LTL cost
+        df["ltl_cost_ind"] = df.apply(
+            lambda r: ltl_cost(r["weight_lbs"], r["distance_miles"], r["freight_class"]),
             axis=1,
         )
-        tl_cost_per_truck = _tl_cost(avg_dist)
-        baseline_cost = shipments["ltl_cost"].sum()
 
-        # Skip MIP if cluster is very small — pure LTL is obviously optimal
-        if total_weight < 2_000 or n == 1:
-            return self._all_ltl(cluster_id, shipments, baseline_cost)
+        # Initialise output columns
+        df["truck_id"]      = "LTL"
+        df["assigned_mode"] = "LTL"
+        df["tl_cost"]       = 0.0
+        df["solver_status"] = "LTL-fallback"
 
-        # ----- Build MILP -----
-        prob = LpProblem(f"LoadOpt_{cluster_id}", LpMinimize)
+        truck_counter = 1
+        wh_lat = df["warehouse_lat"].iloc[0]
+        wh_lon = df["warehouse_lon"].iloc[0]
 
-        ship_ids  = shipments["shipment_id"].tolist()
-        truck_ids = list(range(n_trucks))
+        for region, region_df in df.groupby("region"):
+            assignments, counter_out = self._solve_region(
+                region, region_df, wh_lat, wh_lon, truck_counter
+            )
+            truck_counter = counter_out
+
+            for truck_id, info in assignments.items():
+                idxs = info["indices"]
+                df.loc[idxs, "truck_id"]      = truck_id
+                df.loc[idxs, "assigned_mode"] = "TL"
+                df.loc[idxs, "tl_cost"]       = info["cost"]
+                df.loc[idxs, "solver_status"] = info["status"]
+
+        # Final plan_cost per row
+        truck_sizes = df[df["assigned_mode"] == "TL"].groupby("truck_id").size()
+        df["plan_cost"] = df.apply(
+            lambda r: (
+                r["tl_cost"] / max(1, truck_sizes.get(r["truck_id"], 1))
+                if r["assigned_mode"] == "TL"
+                else r["ltl_cost_ind"]
+            ),
+            axis=1,
+        ).round(2)
+
+        self._plan           = df
+        self._baseline_cost  = df["ltl_cost_ind"].sum()
+        self._optimized_cost = df["plan_cost"].sum()
+        return df
+
+    def plan_summary(self) -> pd.DataFrame:
+        """Per-truck summary table."""
+        if self._plan is None:
+            raise RuntimeError("Call build_plan() first.")
+
+        df      = self._plan
+        tl_rows = df[df["assigned_mode"] == "TL"]
+
+        summary = (
+            tl_rows.groupby("truck_id")
+            .agg(
+                n_shipments  = ("shipment_id",   "count"),
+                total_weight = ("weight_lbs",    "sum"),
+                n_stops      = ("dest_city",     "nunique"),
+                truck_cost   = ("tl_cost",       "first"),
+                ltl_baseline = ("ltl_cost_ind",  "sum"),
+                region       = ("region",        "first"),
+                status       = ("solver_status", "first"),
+            )
+            .reset_index()
+        )
+        summary["savings"]  = summary["ltl_baseline"] - summary["truck_cost"]
+        summary["util_pct"] = (summary["total_weight"] / TL_MAX_LBS * 100).round(1)
+        return summary.sort_values("savings", ascending=False).reset_index(drop=True)
+
+    # ------------------------------------------------------------------
+    # Per-region MILP
+    # ------------------------------------------------------------------
+
+    def _solve_region(
+        self,
+        region: str,
+        region_df: pd.DataFrame,
+        wh_lat: float,
+        wh_lon: float,
+        truck_counter: int,
+    ) -> tuple[Dict, int]:
+        """
+        Solve the MILP for one region.  Returns assignment dict + updated counter.
+        """
+        ship_ids  = region_df["shipment_id"].tolist()
+        indices   = region_df.index.tolist()
+        n         = len(ship_ids)
+
+        if n == 0:
+            return {}, truck_counter
+
+        # Upper bound on trucks: total weight / TL cap + 1 buffer
+        total_w  = region_df["weight_lbs"].sum()
+        n_trucks = max(1, int(np.ceil(total_w / TL_MAX_LBS)) + 1)
+
+        # Distinct destinations
+        dest_keys = region_df[["dest_city", "dest_state"]].apply(
+            lambda r: f"{r['dest_city']}_{r['dest_state']}", axis=1
+        ).tolist()
+        unique_dests = list(set(dest_keys))
+
+        # Shipment → destination index
+        dest_idx = {s: dest_keys[i] for i, s in enumerate(ship_ids)}
+
+        # Pre-compute costs
+        ltl_costs = dict(zip(ship_ids, region_df["ltl_cost_ind"].values))
+        must_tl   = set(
+            region_df.loc[region_df["mode"] == "MUST_TL", "shipment_id"].tolist()
+        )
+
+        # Average TL cost proxy: use centroid distance of region
+        avg_lat  = region_df["dest_lat"].mean()
+        avg_lon  = region_df["dest_lon"].mean()
+        avg_dist = route_distance(wh_lat, wh_lon, [(avg_lat, avg_lon)])
+        tl_cost_proxy = tl_cost(avg_dist * 1.3)  # 1.3× to account for multi-stop detour
+
+        # ------ Build MILP ------
+        prob = LpProblem(f"LoadOpt_{region.replace(' ', '_')}", LpMinimize)
+        T    = list(range(n_trucks))
 
         x = {(s, t): LpVariable(f"x_{s}_{t}", cat=LpBinary)
-             for s in ship_ids for t in truck_ids}
-        y = {t: LpVariable(f"y_{t}", cat=LpBinary) for t in truck_ids}
+             for s in ship_ids for t in T}
+        y = {t: LpVariable(f"y_{t}", cat=LpBinary) for t in T}
+        z = {(d, t): LpVariable(f"z_{d}_{t}", cat=LpBinary)
+             for d in unique_dests for t in T}
 
         # Objective
         prob += (
-            lpSum(tl_cost_per_truck * y[t] for t in truck_ids)
+            lpSum(tl_cost_proxy * y[t] for t in T)
             + lpSum(
-                shipments.loc[shipments["shipment_id"] == s, "ltl_cost"].values[0]
-                * (1 - lpSum(x[s, t] for t in truck_ids))
+                ltl_costs[s] * (1 - lpSum(x[s, t] for t in T))
                 for s in ship_ids
             )
         )
 
-        # Constraints
-        weights = dict(zip(shipments["shipment_id"], shipments["weight_lbs"]))
-        volumes = dict(zip(shipments["shipment_id"], shipments["volume_cuft"]))
+        weights = dict(zip(ship_ids, region_df["weight_lbs"].values))
 
-        for s in ship_ids:
-            prob += lpSum(x[s, t] for t in truck_ids) <= 1, f"assign_{s}"
-
-        for t in truck_ids:
+        for t in T:
+            # Weight capacity
             prob += (
                 lpSum(weights[s] * x[s, t] for s in ship_ids)
-                <= self.tl_weight_cap * y[t],
-                f"weight_cap_{t}",
+                <= TL_MAX_LBS * y[t],
+                f"weight_{t}",
             )
+            # Stop limit
             prob += (
-                lpSum(volumes[s] * x[s, t] for s in ship_ids)
-                <= self.tl_volume_cap * y[t],
-                f"vol_cap_{t}",
+                lpSum(z[d, t] for d in unique_dests)
+                <= MAX_STOPS * y[t],
+                f"stops_{t}",
             )
-            for s in ship_ids:
-                prob += x[s, t] <= y[t], f"link_{s}_{t}"
 
-        # Symmetry breaking — prefer lower-indexed trucks
+        for s in ship_ids:
+            # Each shipment on at most 1 truck
+            prob += lpSum(x[s, t] for t in T) <= 1, f"assign_{s}"
+
+            for t in T:
+                # Link shipment → truck
+                prob += x[s, t] <= y[t], f"link_{s}_{t}"
+                # Link shipment → destination-on-truck
+                prob += x[s, t] <= z[dest_idx[s], t], f"dest_link_{s}_{t}"
+
+        # Force MUST_TL shipments onto a truck
+        for s in must_tl:
+            prob += lpSum(x[s, t] for t in T) == 1, f"must_tl_{s}"
+
+        # Symmetry breaking
         for t in range(1, n_trucks):
             prob += y[t] <= y[t - 1], f"sym_{t}"
 
-        solver = PULP_CBC_CMD(msg=self.solver_msg, timeLimit=30)
+        solver = PULP_CBC_CMD(msg=self.solver_verbose, timeLimit=SOLVER_TIME)
         prob.solve(solver)
+        status = LpStatus[prob.status]
 
-        if LpStatus[prob.status] != "Optimal":
-            # Fall back to all-LTL
-            return self._all_ltl(cluster_id, shipments, baseline_cost)
+        if status not in ("Optimal", "Feasible"):
+            # Fall back: MUST_TL shipments get their own truck each
+            return self._fallback(region_df, wh_lat, wh_lon, truck_counter)
 
-        # ----- Extract solution -----
-        entries: List[LoadPlanEntry] = []
-        assigned: set = set()
+        # ------ Extract solution ------
+        assignments: Dict[str, dict] = {}
 
-        for t in truck_ids:
+        for t in T:
             if value(y[t]) is None or value(y[t]) < 0.5:
                 continue
             on_truck = [
@@ -291,68 +289,48 @@ class LoadOptimizer:
             if not on_truck:
                 continue
 
-            sub = shipments[shipments["shipment_id"].isin(on_truck)]
-            tw  = sub["weight_lbs"].sum()
-            tv  = sub["volume_cuft"].sum()
-            ltl = sub["ltl_cost"].sum()
+            sub   = region_df[region_df["shipment_id"].isin(on_truck)]
+            stops = list(
+                sub[["dest_lat", "dest_lon"]].drop_duplicates()
+                .apply(tuple, axis=1)
+            )
+            route_mi   = route_distance(wh_lat, wh_lon, stops)
+            actual_cost = tl_cost(route_mi)
 
-            entries.append(LoadPlanEntry(
-                cluster_id=cluster_id,
-                truck_id=f"{cluster_id}_TL{t+1}",
-                shipments=on_truck,
-                total_weight=tw,
-                total_volume=tv,
-                mode="TL",
-                tl_cost=tl_cost_per_truck,
-                ltl_cost=ltl,
-                optimized_cost=tl_cost_per_truck,
-                savings=ltl - tl_cost_per_truck,
-            ))
-            assigned.update(on_truck)
+            truck_id = f"TRK-{truck_counter:03d}"
+            truck_counter += 1
 
-        # Remaining shipments ship LTL individually
-        unassigned = [s for s in ship_ids if s not in assigned]
-        for s in unassigned:
-            row = shipments[shipments["shipment_id"] == s].iloc[0]
-            entries.append(LoadPlanEntry(
-                cluster_id=cluster_id,
-                truck_id=f"{cluster_id}_LTL_{s}",
-                shipments=[s],
-                total_weight=row["weight_lbs"],
-                total_volume=row["volume_cuft"],
-                mode="LTL",
-                tl_cost=0.0,
-                ltl_cost=row["ltl_cost"],
-                optimized_cost=row["ltl_cost"],
-                savings=0.0,
-            ))
+            assignments[truck_id] = {
+                "indices": sub.index.tolist(),
+                "cost":    actual_cost,
+                "status":  status,
+            }
 
-        return entries
+        return assignments, truck_counter
 
-    def _all_ltl(
+    def _fallback(
         self,
-        cluster_id: str,
-        shipments: pd.DataFrame,
-        baseline_cost: float,
-    ) -> List[LoadPlanEntry]:
-        """Return individual LTL entries for every shipment in the cluster."""
-        entries = []
-        for _, row in shipments.iterrows():
-            entries.append(LoadPlanEntry(
-                cluster_id=cluster_id,
-                truck_id=f"{cluster_id}_LTL_{row['shipment_id']}",
-                shipments=[row["shipment_id"]],
-                total_weight=row["weight_lbs"],
-                total_volume=row["volume_cuft"],
-                mode="LTL",
-                tl_cost=0.0,
-                ltl_cost=row["ltl_cost"],
-                optimized_cost=row["ltl_cost"],
-                savings=0.0,
-            ))
-        return entries
+        region_df: pd.DataFrame,
+        wh_lat: float,
+        wh_lon: float,
+        truck_counter: int,
+    ) -> tuple[Dict, int]:
+        """
+        Fallback when MILP fails: put each MUST_TL shipment on its own truck.
+        OPTIONAL shipments remain LTL.
+        """
+        assignments = {}
+        must_tl = region_df[region_df["mode"] == "MUST_TL"]
 
-    def _to_dataframe(self) -> pd.DataFrame:
-        if not self._load_plan:
-            return pd.DataFrame()
-        return pd.DataFrame([vars(e) for e in self._load_plan])
+        for _, row in must_tl.iterrows():
+            dist     = route_distance(wh_lat, wh_lon, [(row["dest_lat"], row["dest_lon"])])
+            cost     = tl_cost(dist)
+            truck_id = f"TRK-{truck_counter:03d}"
+            truck_counter += 1
+            assignments[truck_id] = {
+                "indices": [row.name],
+                "cost":    cost,
+                "status":  "LTL-fallback",
+            }
+
+        return assignments, truck_counter
