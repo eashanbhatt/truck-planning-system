@@ -21,7 +21,7 @@ from tabulate import tabulate
 
 from src.data_loader  import load_shipments, summary as data_summary
 from src.clustering   import LoadConsolidator
-from src.cost_utils   import baseline_ltl_cost
+from src.cost_utils   import baseline_ltl_cost, save_savings_summary
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -34,7 +34,9 @@ def parse_args():
     p.add_argument("--input",  default="data/sample_shipments.csv",
                    help="Path to input CSV  (default: data/sample_shipments.csv)")
     p.add_argument("--output", default="output/clustering_plan.csv",
-                   help="Path for output CSV  (default: output/clustering_plan.csv)")
+                   help="Path for load plan CSV  (default: output/clustering_plan.csv)")
+    p.add_argument("--savings", default="output/clustering_savings.csv",
+                   help="Path for savings summary CSV  (default: output/clustering_savings.csv)")
     p.add_argument("--zones",  type=int, default=8,
                    help="KMeans k — number of geographic zones  (default: 8)")
     p.add_argument("--max-miles", type=float, default=200,
@@ -159,7 +161,9 @@ def main():
         "distance_miles", "tl_cost", "ltl_cost_ind", "plan_cost",
     ]
     plan[output_cols].to_csv(args.output, index=False)
-    print(f"  Load plan saved → {args.output}\n")
+    print(f"  Load plan saved    → {args.output}")
+    save_savings_summary(plan, args.savings, module="Clustering")
+    print()
 
 
 if __name__ == "__main__":

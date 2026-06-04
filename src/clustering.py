@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.preprocessing import StandardScaler
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 from src.cost_utils import ltl_cost, tl_cost, route_distance
 
@@ -68,7 +68,7 @@ class LoadConsolidator:
         self.n_zones = n_zones
         self.max_cluster_miles = max_cluster_miles
         self.seed = seed
-        self._plan: pd.DataFrame | None = None
+        self._plan: Optional[pd.DataFrame] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -233,14 +233,11 @@ class LoadConsolidator:
             def _close_truck():
                 nonlocal current_truck, current_weight, current_stops, current_indices
                 if current_indices:
-                    stops_list = [
-                        (df.at[i, "dest_lat"], df.at[i, "dest_lon"])
-                        for i in set(
-                            df.loc[current_indices, ["dest_lat", "dest_lon"]]
-                            .drop_duplicates()
-                            .apply(tuple, axis=1)
-                        )
-                    ]
+                    stops_list = list(
+                        df.loc[current_indices, ["dest_lat", "dest_lon"]]
+                        .drop_duplicates()
+                        .apply(tuple, axis=1)
+                    )
                     route_mi = route_distance(wh_lat, wh_lon, stops_list)
                     truck_cost = tl_cost(route_mi)
                     all_assignments[current_truck] = {

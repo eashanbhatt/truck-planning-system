@@ -23,7 +23,7 @@ from tabulate import tabulate
 
 from src.data_loader import load_shipments, summary as data_summary
 from src.optimizer   import LoadOptimizer
-from src.cost_utils  import baseline_ltl_cost
+from src.cost_utils  import baseline_ltl_cost, save_savings_summary
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -36,7 +36,9 @@ def parse_args():
     p.add_argument("--input",   default="data/sample_shipments.csv",
                    help="Path to input CSV  (default: data/sample_shipments.csv)")
     p.add_argument("--output",  default="output/milp_plan.csv",
-                   help="Path for output CSV  (default: output/milp_plan.csv)")
+                   help="Path for load plan CSV  (default: output/milp_plan.csv)")
+    p.add_argument("--savings", default="output/milp_savings.csv",
+                   help="Path for savings summary CSV  (default: output/milp_savings.csv)")
     p.add_argument("--verbose", action="store_true",
                    help="Print CBC solver logs for each region")
     return p.parse_args()
@@ -180,7 +182,9 @@ def main():
         "tl_cost", "ltl_cost_ind", "plan_cost", "solver_status",
     ]
     plan[output_cols].to_csv(args.output, index=False)
-    print(f"  Load plan saved → {args.output}\n")
+    print(f"  Load plan saved    → {args.output}")
+    save_savings_summary(plan, args.savings, module="MILP Optimizer")
+    print()
 
 
 if __name__ == "__main__":

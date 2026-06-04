@@ -42,7 +42,7 @@ Solver: CBC (bundled with PuLP — no licence required)
 
 import numpy as np
 import pandas as pd
-from typing import List, Dict
+from typing import List, Dict, Optional
 from pulp import (
     LpProblem, LpMinimize, LpVariable, LpBinary,
     lpSum, value, PULP_CBC_CMD, LpStatus,
@@ -75,7 +75,7 @@ class LoadOptimizer:
 
     def __init__(self, solver_verbose: bool = False):
         self.solver_verbose = solver_verbose
-        self._plan: pd.DataFrame | None = None
+        self._plan: Optional[pd.DataFrame] = None
         self._baseline_cost: float = 0.0
         self._optimized_cost: float = 0.0
 

@@ -144,3 +144,76 @@ def baseline_ltl_cost(df: pd.DataFrame) -> float:
         lambda r: ltl_cost(r["weight_lbs"], r["distance_miles"], r["freight_class"]),
         axis=1,
     ).sum()
+
+
+# ---------------------------------------------------------------------------
+# Savings summary CSV writer
+# ---------------------------------------------------------------------------
+
+def save_savings_summary(plan: pd.DataFrame, output_path: str, module: str) -> None:
+    """
+    Write a tiered savings summary CSV with three sections:
+      OVERALL  — single row with full-plan totals
+      REGION   — one row per US region
+      TRUCK    — one row per TL truck
+      LTL      — one row for all LTL shipments combined
+
+    Parameters
+    ----------
+    plan        : annotated DataFrame from build_plan() (either module)
+    output_path : file path for the output CSV
+    module      : label string, e.g. "Clustering" or "MILP Optimizer"
+    """
+    rows = []
+
+    def _row(section, label, sub_df):
+        n         = len(sub_df)
+        weight    = sub_df["weight_lbs"].sum()
+        baseline  = sub_df["ltl_cost_ind"].sum()
+        optimized = sub_df["plan_cost"].sum()
+        savings   = baseline - optimized
+        pct       = round(savings / baseline * 100, 1) if baseline else 0.0
+        n_tl      = (sub_df["assigned_mode"] == "TL").sum()
+        n_ltl     = (sub_df["assigned_mode"] == "LTL").sum()
+        return {
+            "section":            section,
+            "label":              label,
+            "module":             module,
+            "shipments":          n,
+            "tl_shipments":       n_tl,
+            "ltl_shipments":      n_ltl,
+            "total_weight_lbs":   round(weight, 0),
+            "baseline_ltl_cost":  round(baseline, 2),
+            "optimized_cost":     round(optimized, 2),
+            "savings":            round(savings, 2),
+            "savings_pct":        pct,
+        }
+
+    # OVERALL
+    rows.append(_row("OVERALL", "All Shipments", plan))
+
+    # Per REGION
+    for region, grp in plan.groupby("region"):
+        rows.append(_row("REGION", region, grp))
+
+    # Per TL TRUCK
+    tl_plan = plan[plan["assigned_mode"] == "TL"]
+    for truck_id, grp in tl_plan.groupby("truck_id"):
+        rows.append(_row("TRUCK", truck_id, grp))
+
+    # LTL aggregate
+    ltl_plan = plan[plan["assigned_mode"] == "LTL"]
+    if len(ltl_plan):
+        rows.append(_row("LTL", "All LTL Shipments", ltl_plan))
+
+    summary_df = pd.DataFrame(rows)
+
+    # Format cost columns as currency strings for readability
+    for col in ["baseline_ltl_cost", "optimized_cost", "savings"]:
+        summary_df[col] = summary_df[col].map("${:,.2f}".format)
+    summary_df["savings_pct"] = summary_df["savings_pct"].map("{}%".format)
+
+    import os
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    summary_df.to_csv(output_path, index=False)
+    print(f"  Savings summary saved → {output_path}")
