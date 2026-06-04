@@ -50,7 +50,15 @@ def parse_args():
     )
     p.add_argument(
         "--threshold", type=float, default=200.0,
-        help="Max intra-cluster haversine distance in miles (default: 200)",
+        help="Composite distance threshold in miles-equivalent (default: 200)",
+    )
+    p.add_argument(
+        "--haversine-weight", type=float, default=0.6,
+        help="Weight for haversine distance component (default: 0.6)",
+    )
+    p.add_argument(
+        "--bearing-weight", type=float, default=0.4,
+        help="Weight for bearing-difference component (default: 0.4)",
     )
     p.add_argument(
         "--plan-out", default=os.path.join(os.path.dirname(__file__), "output", "clustering_plan.csv"),
@@ -66,10 +74,10 @@ def parse_args():
 def main():
     args = parse_args()
 
-    print(f"\n{'═'*54}")
-    print("  SOLUTION 1 — HAVERSINE CLUSTERING")
-    print("  AgglomerativeClustering (precomputed haversine)")
-    print(f"{'═'*54}")
+    print(f"\n{'═'*58}")
+    print("  SOLUTION 1 — HAVERSINE + BEARING CLUSTERING")
+    print("  AgglomerativeClustering (precomputed composite matrix)")
+    print(f"{'═'*58}")
 
     # ── 1. Load ───────────────────────────────────────────────────────────
     print(f"\n[1/4]  Loading  '{args.input}' …")
@@ -88,10 +96,22 @@ def main():
     print(f"\n  Baseline cost (all LTL): ${baseline:,.0f}")
 
     # ── 2. Cluster ────────────────────────────────────────────────────────
-    print(f"\n[2/4]  Building haversine distance matrix + clustering "
-          f"(threshold = {args.threshold:.0f} mi) …")
+    wh_lat = float(df["warehouse_lat"].iloc[0])
+    wh_lon = float(df["warehouse_lon"].iloc[0])
+
+    print(f"\n[2/4]  Building composite distance matrix …")
+    print(f"       Haversine weight : {args.haversine_weight:.0%}")
+    print(f"       Bearing weight   : {args.bearing_weight:.0%}")
+    print(f"       Threshold        : {args.threshold:.0f} miles-equivalent")
     t0 = time.time()
-    clustered = build_clusters(df, distance_threshold_miles=args.threshold)
+    clustered = build_clusters(
+        df,
+        wh_lat=wh_lat,
+        wh_lon=wh_lon,
+        distance_threshold_miles=args.threshold,
+        haversine_weight=args.haversine_weight,
+        bearing_weight=args.bearing_weight,
+    )
     n_clusters = clustered["cluster_id"].nunique()
     print(f"  {n_clusters} clusters formed from {len(df)} shipments")
 
@@ -100,11 +120,15 @@ def main():
     from tabulate import tabulate
     display = cs.head(8)[
         ["cluster_id", "n_shipments", "total_weight", "n_destinations",
-         "must_tl_count", "max_intra_dist_mi", "cities"]
+         "must_tl_count", "direction", "mean_bearing",
+         "bearing_spread_deg", "max_intra_dist_mi", "cities"]
     ].copy()
-    display["total_weight"] = display["total_weight"].map("{:,.0f}".format)
+    display["total_weight"]      = display["total_weight"].map("{:,.0f}".format)
+    display["mean_bearing"]      = display["mean_bearing"].map("{:.0f}°".format)
+    display["bearing_spread_deg"]= display["bearing_spread_deg"].map("{:.0f}°".format)
     display.columns = ["Cluster", "Shpmnts", "Weight (lbs)", "Dests",
-                       "MUST_TL", "Max Dist (mi)", "Cities"]
+                       "MUST_TL", "Dir", "Avg Bearing",
+                       "Bearing Spread", "Max Dist (mi)", "Cities"]
     print(tabulate(display, headers="keys", tablefmt="rounded_outline", showindex=False))
 
     # ── 3. Pack ───────────────────────────────────────────────────────────

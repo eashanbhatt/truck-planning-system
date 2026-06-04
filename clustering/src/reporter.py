@@ -50,9 +50,9 @@ def print_results(plan: pd.DataFrame, baseline: float, elapsed: float) -> None:
             / TL_MAX_LBS * 100
         )
         print(f"  {'Avg TL weight utilisation':<36} {avg_util:>14.1f}%")
-    print(f"  {'Distance metric':<36} {'Haversine (great-circle)':>15}")
+    print(f"  {'Distance metric':<36} {'Haversine + Bearing':>15}")
     print(f"  {'Clustering algorithm':<36} {'AgglomerativeClustering':>15}")
-    print(f"  {'Linkage':<36} {'complete':>15}")
+    print(f"  {'Linkage / matrix':<36} {'complete / precomputed':>15}")
     print(f"  {'Plan generated in':<36} {elapsed:>14.2f}s")
     print(f"{'═'*54}\n")
 
@@ -118,9 +118,10 @@ def _truck_table(plan: pd.DataFrame, tl_df: pd.DataFrame) -> pd.DataFrame:
 PLAN_COLS = [
     "shipment_id", "warehouse", "dest_city", "dest_state",
     "weight_lbs", "freight_class", "pickup_date", "delivery_due",
-    "mode_flag", "cluster_id", "cluster_size",
+    "mode_flag", "wh_to_dest_mi", "bearing_deg",
+    "cluster_id", "cluster_size",
     "truck_id", "assigned_mode", "truck_weight", "truck_n_stops",
-    "wh_to_dest_mi", "tl_cost", "ltl_cost_each", "plan_cost",
+    "tl_cost", "ltl_cost_each", "plan_cost",
 ]
 
 
